@@ -40,12 +40,17 @@ fn decode_account(encoded: &str) -> Result<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
+struct Account {
     #[serde(serialize_with = "serialize_account", deserialize_with = "deserialize_account")]
     user_account: String,
     #[serde(serialize_with = "serialize_password", deserialize_with = "deserialize_password")]
     password: String,
     device_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Config {
+    accounts: Vec<Account>,
 }
 
 fn serialize_account<S>(account: &str, serializer: S) -> Result<S::Ok, S::Error>
@@ -87,21 +92,35 @@ impl Config {
             let config: Config = serde_json::from_str(&content)?;
             Ok(config)
         } else {
-            let device_code = format!("web_{}", generate_random_string(32));
+            let mut accounts = Vec::new();
             
-            print!("账号: ");
-            io::stdout().flush()?;
-            let user_account = io::stdin().lock().lines().next().unwrap().unwrap();
+            loop {
+                let device_code = format!("web_{}", generate_random_string(32));
+                
+                print!("账号: ");
+                io::stdout().flush()?;
+                let user_account = io::stdin().lock().lines().next().unwrap().unwrap();
+                
+                print!("密码: ");
+                io::stdout().flush()?;
+                let password = io::stdin().lock().lines().next().unwrap().unwrap();
+                
+                accounts.push(Account {
+                    user_account,
+                    password,
+                    device_code,
+                });
+                
+                print!("是否继续添加账号？(y/n): ");
+                io::stdout().flush()?;
+                let choice = io::stdin().lock().lines().next().unwrap().unwrap();
+                
+                if choice.to_lowercase() != "y" {
+                    break;
+                }
+            }
             
-            print!("密码: ");
-            io::stdout().flush()?;
-            let password = io::stdin().lock().lines().next().unwrap().unwrap();
-            
-            let config = Config {
-                user_account,
-                password,
-                device_code,
-            };
+            let config = Config { accounts };
             
             let json = serde_json::to_string_pretty(&config)?;
             fs::write(config_path, json)?;
@@ -893,52 +912,69 @@ async fn keep_alive_worker(
 async fn main() -> Result<()> {
     let config = Config::load_or_create()?;
 
-    let mut api = CtYunApi::new(config.device_code);
-
-    if !api.login(&config.user_account, &config.password).await {
-        write_line("登录失败");
+    if config.accounts.is_empty() {
+        write_line("没有配置的账号");
         return Ok(());
     }
 
-    write_line("登录成功");
+    let mut all_desktops = Vec::new();
 
-    let desktop_list = match api.get_client_list().await {
-        Some(list) => list,
-        None => {
-            write_line("获取设备列表失败");
-            return Ok(());
+    for account in &config.accounts {
+        write_line(&format!("正在登录账号: {}", account.user_account));
+        
+        let mut api = CtYunApi::new(account.device_code.clone());
+
+        if !api.login(&account.user_account, &account.password).await {
+            write_line(&format!("账号 {} 登录失败", account.user_account));
+            continue;
         }
-    };
 
-    if desktop_list.is_empty() {
+        write_line(&format!("账号 {} 登录成功", account.user_account));
+
+        let desktop_list = match api.get_client_list().await {
+            Some(list) => list,
+            None => {
+                write_line(&format!("账号 {} 获取设备列表失败", account.user_account));
+                continue;
+            }
+        };
+
+        if desktop_list.is_empty() {
+            write_line(&format!("账号 {} 没有可用的设备", account.user_account));
+            continue;
+        }
+
+        for desktop in desktop_list {
+            all_desktops.push((desktop, account.device_code.clone()));
+        }
+    }
+
+    if all_desktops.is_empty() {
         write_line("没有可用的设备");
         return Ok(());
     }
 
-    let api = Arc::new(Mutex::new(api));
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-
     let mut handles = Vec::new();
 
-    for desktop in desktop_list {
-        let api_clone = Arc::clone(&api);
+    for (desktop, device_code) in all_desktops {
+        let api = CtYunApi::new(device_code);
+        
+        let connect_info = match api.connect(&desktop.desktop_id).await {
+            Ok((info, _)) => info,
+            Err(e) => {
+                write_line(&format!("[{}] 连接失败: {}", desktop.desktop_code, e));
+                continue;
+            }
+        };
+
+        let mut desktop_with_info = desktop.clone();
+        desktop_with_info.desktop_info = Some(connect_info.desktop_info);
+        let api = Arc::new(Mutex::new(api));
         let shutdown_rx = shutdown_tx.subscribe();
 
         let handle = tokio::spawn(async move {
-            let api_guard = api_clone.lock().await;
-            let connect_info = match api_guard.connect(&desktop.desktop_id).await {
-                Ok((info, _)) => info,
-                Err(e) => {
-                    write_line(&format!("[{}] 连接失败: {}", desktop.desktop_code, e));
-                    return;
-                }
-            };
-            drop(api_guard);
-
-            let mut desktop_with_info = desktop.clone();
-            desktop_with_info.desktop_info = Some(connect_info.desktop_info);
-
-            keep_alive_worker(desktop_with_info, api_clone, shutdown_rx).await;
+            keep_alive_worker(desktop_with_info, api, shutdown_rx).await;
         });
 
         handles.push(handle);
