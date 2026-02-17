@@ -15,10 +15,8 @@ use sha1::Sha1;
 use sha2::Sha256;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::Networks;
@@ -81,22 +79,30 @@ fn encrypt_data(plaintext: &str, key: &[u8; 32]) -> Result<String> {
 }
 
 fn decrypt_data(ciphertext_b64: &str, key: &[u8; 32]) -> Result<String> {
-    let data = STANDARD.decode(ciphertext_b64)?;
-    
-    if data.len() < 12 {
-        return Err(anyhow!("Invalid ciphertext"));
+    match STANDARD.decode(ciphertext_b64) {
+        Ok(data) => {
+            if data.len() < 12 {
+                return Err(anyhow!("Invalid ciphertext: too short"));
+            }
+            
+            let nonce_bytes = &data[0..12];
+            let ciphertext = &data[12..];
+            
+            let cipher = ChaCha20Poly1305::new(key.into());
+            let nonce = Nonce::from_slice(nonce_bytes);
+            
+            match cipher.decrypt(nonce, ciphertext) {
+                Ok(plaintext) => {
+                    match String::from_utf8(plaintext) {
+                        Ok(s) => Ok(s),
+                        Err(e) => Err(anyhow!("UTF-8 decode failed: {}", e))
+                    }
+                }
+                Err(e) => Err(anyhow!("Decryption failed: {}", e))
+            }
+        }
+        Err(e) => Err(anyhow!("Base64 decode failed: {}", e))
     }
-    
-    let nonce_bytes = &data[0..12];
-    let ciphertext = &data[12..];
-    
-    let cipher = ChaCha20Poly1305::new(key.into());
-    let nonce = Nonce::from_slice(nonce_bytes);
-    
-    let plaintext = cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow!("Decryption failed: {}", e))?;
-    
-    Ok(String::from_utf8(plaintext)?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -853,41 +859,36 @@ fn read_line(prompt: &str) -> Result<String> {
 }
 
 fn resolve_accounts() -> Result<Vec<Account>> {
-    if Path::new("/.dockerenv").exists() {
-        let user = env::var("APP_USER").unwrap_or_default();
-        let password = env::var("APP_PASSWORD").unwrap_or_default();
-        let device_code = env::var("DEVICECODE").unwrap_or_default();
-        if user.is_empty() {
-            return Ok(Vec::new());
-        }
-        return Ok(vec![Account {
-            user_account: user,
-            password,
-            device_code,
-        }]);
-    }
-
     let system_fingerprint = get_system_fingerprint();
     let config_file = "config.json";
     
-    if let Ok(data) = fs::read_to_string(config_file)
-        && let Ok(accounts_file) = serde_json::from_str::<AccountsFile>(&data)
-        && !accounts_file.accounts.is_empty()
-    {
-        let key = derive_key(&system_fingerprint, &accounts_file.salt)?;
-        let mut decoded = Vec::new();
-        for account in accounts_file.accounts {
-            let user = decrypt_data(&account.user_account, &key).unwrap_or_default();
-            let password = decrypt_data(&account.password, &key).unwrap_or_default();
-            if !user.is_empty() {
-                decoded.push(Account {
-                    user_account: user,
-                    password,
-                    device_code: account.device_code,
-                });
+    if let Ok(data) = fs::read_to_string(config_file) {
+        match serde_json::from_str::<AccountsFile>(&data) {
+            Ok(accounts_file) => {
+                if !accounts_file.accounts.is_empty() {
+                    let key = derive_key(&system_fingerprint, &accounts_file.salt)?;
+                    let mut decoded = Vec::new();
+                    for account in accounts_file.accounts {
+                        if let Ok(user) = decrypt_data(&account.user_account, &key)
+                            && let Ok(password) = decrypt_data(&account.password, &key)
+                            && !user.is_empty()
+                        {
+                            decoded.push(Account {
+                                user_account: user,
+                                password,
+                                device_code: account.device_code,
+                            });
+                        }
+                    }
+                    if !decoded.is_empty() {
+                        return Ok(decoded);
+                    }
+                }
+            }
+            Err(e) => {
+                write_line(&format!("解析 config.json 失败: {}", e));
             }
         }
-        return Ok(decoded);
     }
 
     let salt = generate_salt();
@@ -1128,12 +1129,9 @@ async fn keep_alive_worker(
 async fn main() -> Result<()> {
     write_line("版本：v 1.0.0");
     
-    ctrlc::set_handler(|| {
-        std::process::exit(0);
-    })?;
-    
     let accounts = resolve_accounts()?;
     if accounts.is_empty() {
+        write_line("未找到账号信息");
         return Ok(());
     }
 
@@ -1169,14 +1167,6 @@ async fn main() -> Result<()> {
 
         let mut active = Vec::new();
         for mut desktop in desktops {
-            if desktop.use_status_text != "运行中" {
-                write_line(&format!(
-                    "[{}] [{}]电脑未开机，正在开机，请在2分钟后重新运行软件",
-                    desktop.desktop_code,
-                    desktop.use_status_text
-                ));
-            }
-
             match api.connect(&desktop.desktop_id).await {
                 Ok((info, _)) => {
                     desktop.desktop_info = Some(info.desktop_info);
