@@ -937,19 +937,51 @@ async fn keep_alive_worker(
         desktop.desktop_info.as_ref().unwrap().clink_lvs_out_host,
         desktop.desktop_id
     );
+    let host = desktop
+        .desktop_info
+        .as_ref()
+        .unwrap()
+        .clink_lvs_out_host
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let port = desktop
+        .desktop_info
+        .as_ref()
+        .unwrap()
+        .clink_lvs_out_host
+        .split(':')
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
+    let servername = format!(
+        "{}:{}",
+        desktop.desktop_info.as_ref().unwrap().host,
+        desktop.desktop_info.as_ref().unwrap().port
+    );
+    let connect_message = serde_json::json!({
+        "type": 1,
+        "ssl": 1,
+        "host": host,
+        "port": port,
+        "ca": desktop.desktop_info.as_ref().unwrap().ca_cert,
+        "cert": desktop.desktop_info.as_ref().unwrap().client_cert,
+        "key": desktop.desktop_info.as_ref().unwrap().client_key,
+        "servername": servername,
+        "oqs": 0,
+    });
+    let connect_message_text = serde_json::to_string(&connect_message).unwrap();
 
     loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                write_line(&format!("[{}] 正在退出...", desktop.desktop_code));
-                break;
-            }
-            _ = tokio::time::sleep(Duration::from_secs(0)) => {}
+        if shutdown_rx.try_recv().is_ok() {
+            write_line(&format!("[{}] 正在退出...", desktop.desktop_code));
+            break;
         }
 
         write_line(&format!("[{}] === 新周期开始，尝试连接 ===", desktop.desktop_code));
 
-        let mut request = match uri.clone().into_client_request() {
+        let mut request = match uri.as_str().into_client_request() {
             Ok(req) => req,
             Err(e) => {
                 write_line(&format!("[{}] 异常: {}", desktop.desktop_code, e));
@@ -966,21 +998,9 @@ async fn keep_alive_worker(
 
         match connect_async(request).await {
             Ok((ws_stream, _)) => {
-                let connect_message = serde_json::json!({
-                    "type": 1,
-                    "ssl": 1,
-                    "host": desktop.desktop_info.as_ref().unwrap().clink_lvs_out_host.split(':').next().unwrap_or(""),
-                    "port": desktop.desktop_info.as_ref().unwrap().clink_lvs_out_host.split(':').nth(1).unwrap_or(""),
-                    "ca": desktop.desktop_info.as_ref().unwrap().ca_cert,
-                    "cert": desktop.desktop_info.as_ref().unwrap().client_cert,
-                    "key": desktop.desktop_info.as_ref().unwrap().client_key,
-                    "servername": format!("{}:{}", desktop.desktop_info.as_ref().unwrap().host, desktop.desktop_info.as_ref().unwrap().port),
-                    "oqs": 0,
-                });
-
                 let mut ws = ws_stream;
 
-                if ws.send(Message::Text(serde_json::to_string(&connect_message).unwrap())).await.is_ok() {
+                if ws.send(Message::Text(connect_message_text.clone())).await.is_ok() {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     let _ = ws.send(Message::Binary(initial_payload.clone())).await;
 

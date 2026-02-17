@@ -5,7 +5,7 @@
 ## 功能特性
 
 - 自动登录天翼云桌面
-- 支持多个云桌面同时保活
+- 支持多账号与多云桌面同时保活
 - WebSocket 连接保持活跃
 - 验证码自动识别
 - 配置文件存储（密码加密）
@@ -23,8 +23,9 @@ cargo run --release
 
 ## 配置文件
 
-配置文件 `config.json` 存储在项目根目录，包含以下信息：
+配置文件 `config.json` 存储在项目根目录，包含以下信息（支持多个账号）：
 
+- `accounts`: 账号列表
 - `user_account`: 天翼云账号
 - `password`: 密码（Base64 编码存储）
 - `device_code`: 设备代码（自动生成）
@@ -41,6 +42,7 @@ cargo build --release
 
 - Rust 1.93.1 或更高版本
 - 互联网连接
+- TLS: rustls
 
 ## 注意事项
 
