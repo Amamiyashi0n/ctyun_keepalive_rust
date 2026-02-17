@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, aead::Aead};
 use chrono::Local;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use hex::ToHex;
 use md5::{Md5, Digest};
 use num_bigint::BigUint;
 use num_traits::Zero;
@@ -19,19 +21,82 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use sysinfo::Networks;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use urlencoding::encode;
 
-fn encode_base64(value: &str) -> String {
-    STANDARD.encode(value.as_bytes())
+
+
+fn get_system_fingerprint() -> String {
+    let networks = Networks::new_with_refreshed_list();
+    let mac_address = networks
+        .iter()
+        .next()
+        .map(|(_, net)| net.mac_address().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    let fingerprint = mac_address;
+    
+    let mut hasher = Sha256::new();
+    hasher.update(fingerprint.as_bytes());
+    hasher.finalize().to_vec().encode_hex::<String>()
 }
 
-fn decode_base64(encoded: &str) -> Result<String> {
-    let bytes = STANDARD.decode(encoded)?;
-    Ok(String::from_utf8(bytes)?)
+fn generate_salt() -> String {
+    let mut rng = rand::thread_rng();
+    let mut salt = [0u8; 16];
+    rng.fill(&mut salt);
+    salt.encode_hex::<String>()
+}
+
+fn derive_key(system_fingerprint: &str, salt: &str) -> Result<[u8; 32]> {
+    let key_material = format!("{}|{}", system_fingerprint, salt);
+    let mut hasher = Sha256::new();
+    hasher.update(key_material.as_bytes());
+    let hash = hasher.finalize();
+    
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&hash);
+    Ok(key)
+}
+
+fn encrypt_data(plaintext: &str, key: &[u8; 32]) -> Result<String> {
+    let cipher = ChaCha20Poly1305::new(key.into());
+    
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    
+    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+    
+    let mut result = Vec::new();
+    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&ciphertext);
+    
+    Ok(STANDARD.encode(&result))
+}
+
+fn decrypt_data(ciphertext_b64: &str, key: &[u8; 32]) -> Result<String> {
+    let data = STANDARD.decode(ciphertext_b64)?;
+    
+    if data.len() < 12 {
+        return Err(anyhow!("Invalid ciphertext"));
+    }
+    
+    let nonce_bytes = &data[0..12];
+    let ciphertext = &data[12..];
+    
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let nonce = Nonce::from_slice(nonce_bytes);
+    
+    let plaintext = cipher.decrypt(nonce, ciphertext)
+        .map_err(|e| anyhow!("Decryption failed: {}", e))?;
+    
+    Ok(String::from_utf8(plaintext)?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +111,7 @@ struct Account {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AccountsFile {
+    salt: String,
     accounts: Vec<Account>,
 }
 
@@ -801,15 +867,18 @@ fn resolve_accounts() -> Result<Vec<Account>> {
         }]);
     }
 
+    let system_fingerprint = get_system_fingerprint();
     let config_file = "config.json";
+    
     if let Ok(data) = fs::read_to_string(config_file)
-        && let Ok(accounts) = serde_json::from_str::<AccountsFile>(&data)
-        && !accounts.accounts.is_empty()
+        && let Ok(accounts_file) = serde_json::from_str::<AccountsFile>(&data)
+        && !accounts_file.accounts.is_empty()
     {
+        let key = derive_key(&system_fingerprint, &accounts_file.salt)?;
         let mut decoded = Vec::new();
-        for account in accounts.accounts {
-            let user = decode_base64(&account.user_account).unwrap_or_default();
-            let password = decode_base64(&account.password).unwrap_or_default();
+        for account in accounts_file.accounts {
+            let user = decrypt_data(&account.user_account, &key).unwrap_or_default();
+            let password = decrypt_data(&account.password, &key).unwrap_or_default();
             if !user.is_empty() {
                 decoded.push(Account {
                     user_account: user,
@@ -821,19 +890,24 @@ fn resolve_accounts() -> Result<Vec<Account>> {
         return Ok(decoded);
     }
 
-    let mut accounts = AccountsFile { accounts: Vec::new() };
+    let salt = generate_salt();
+    let key = derive_key(&system_fingerprint, &salt)?;
+    let mut accounts_file = AccountsFile {
+        salt,
+        accounts: Vec::new(),
+    };
 
     loop {
         let device_code = format!("web_{}", generate_random_string(32));
         let user = read_line("账号: ")?;
         let password = read_line("密码: ")?;
 
-        let encoded_user = encode_base64(&user);
-        let encoded_password = encode_base64(&password);
+        let encrypted_user = encrypt_data(&user, &key)?;
+        let encrypted_password = encrypt_data(&password, &key)?;
 
-        accounts.accounts.push(Account {
-            user_account: encoded_user,
-            password: encoded_password,
+        accounts_file.accounts.push(Account {
+            user_account: encrypted_user,
+            password: encrypted_password,
             device_code: device_code.clone(),
         });
 
@@ -843,13 +917,13 @@ fn resolve_accounts() -> Result<Vec<Account>> {
         }
     }
 
-    let data = serde_json::to_string_pretty(&accounts)?;
+    let data = serde_json::to_string_pretty(&accounts_file)?;
     let _ = fs::write(config_file, data);
 
     let mut decoded = Vec::new();
-    for account in accounts.accounts {
-        let user = decode_base64(&account.user_account).unwrap_or_default();
-        let password = decode_base64(&account.password).unwrap_or_default();
+    for account in accounts_file.accounts {
+        let user = decrypt_data(&account.user_account, &key).unwrap_or_default();
+        let password = decrypt_data(&account.password, &key).unwrap_or_default();
         if !user.is_empty() {
             decoded.push(Account {
                 user_account: user,
@@ -1014,7 +1088,7 @@ async fn keep_alive_worker(
                         ws,
                         desktop_clone,
                         api_clone,
-                        Duration::from_secs(60 * 60),
+                        Duration::from_secs(60),
                     ).await;
 
                     if let Err(e) = result {
@@ -1053,6 +1127,11 @@ async fn keep_alive_worker(
 #[tokio::main]
 async fn main() -> Result<()> {
     write_line("版本：v 1.0.0");
+    
+    ctrlc::set_handler(|| {
+        std::process::exit(0);
+    })?;
+    
     let accounts = resolve_accounts()?;
     if accounts.is_empty() {
         return Ok(());
