@@ -11,124 +11,42 @@ use reqwest::{Client, multipart};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::Sha256;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::env;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use urlencoding::encode;
 
-fn encode_password(password: &str) -> String {
-    STANDARD.encode(password.as_bytes())
+fn encode_base64(value: &str) -> String {
+    STANDARD.encode(value.as_bytes())
 }
 
-fn decode_password(encoded: &str) -> Result<String> {
-    let bytes = STANDARD.decode(encoded)?;
-    Ok(String::from_utf8(bytes)?)
-}
-
-fn encode_account(account: &str) -> String {
-    STANDARD.encode(account.as_bytes())
-}
-
-fn decode_account(encoded: &str) -> Result<String> {
+fn decode_base64(encoded: &str) -> Result<String> {
     let bytes = STANDARD.decode(encoded)?;
     Ok(String::from_utf8(bytes)?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Account {
-    #[serde(serialize_with = "serialize_account", deserialize_with = "deserialize_account")]
+    #[serde(rename = "user_account")]
     user_account: String,
-    #[serde(serialize_with = "serialize_password", deserialize_with = "deserialize_password")]
+    #[serde(rename = "password")]
     password: String,
+    #[serde(rename = "device_code")]
     device_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Config {
+struct AccountsFile {
     accounts: Vec<Account>,
-}
-
-fn serialize_account<S>(account: &str, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&encode_account(account))
-}
-
-fn deserialize_account<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let encoded = String::deserialize(deserializer)?;
-    decode_account(&encoded).map_err(serde::de::Error::custom)
-}
-
-fn serialize_password<S>(password: &str, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&encode_password(password))
-}
-
-fn deserialize_password<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let encoded = String::deserialize(deserializer)?;
-    decode_password(&encoded).map_err(serde::de::Error::custom)
-}
-
-impl Config {
-    fn load_or_create() -> Result<Self> {
-        let config_path = "config.json";
-        
-        if Path::new(config_path).exists() {
-            let content = fs::read_to_string(config_path)?;
-            let config: Config = serde_json::from_str(&content)?;
-            Ok(config)
-        } else {
-            let mut accounts = Vec::new();
-            
-            loop {
-                let device_code = format!("web_{}", generate_random_string(32));
-                
-                print!("账号: ");
-                io::stdout().flush()?;
-                let user_account = io::stdin().lock().lines().next().unwrap().unwrap();
-                
-                print!("密码: ");
-                io::stdout().flush()?;
-                let password = io::stdin().lock().lines().next().unwrap().unwrap();
-                
-                accounts.push(Account {
-                    user_account,
-                    password,
-                    device_code,
-                });
-                
-                print!("是否继续添加账号？(y/n): ");
-                io::stdout().flush()?;
-                let choice = io::stdin().lock().lines().next().unwrap().unwrap();
-                
-                if choice.to_lowercase() != "y" {
-                    break;
-                }
-            }
-            
-            let config = Config { accounts };
-            
-            let json = serde_json::to_string_pretty(&config)?;
-            fs::write(config_path, json)?;
-            
-            println!("配置已保存到 {}", config_path);
-            Ok(config)
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,7 +90,7 @@ struct ResultBase<T> {
     code: i32,
     #[serde(default)]
     msg: String,
-    data: T,
+    data: Option<T>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -440,8 +358,12 @@ impl CtYunApi {
             };
 
             if result.code == 0 {
-                self.login_info = Some(result.data);
-                return true;
+                if let Some(data) = result.data {
+                    self.login_info = Some(data);
+                    return true;
+                }
+                write_line("Login Error: missing data");
+                continue;
             }
 
             let msg = if result.msg.is_empty() { "Unknown error".to_string() } else { result.msg.clone() };
@@ -451,6 +373,63 @@ impl CtYunApi {
             }
         }
         false
+    }
+
+    async fn get_sms_code(&self, user_phone: &str) -> bool {
+        for i in 0..3 {
+            let captcha_code = self
+                .get_captcha(self.get_sms_code_captcha().await)
+                .await
+                .unwrap_or_default();
+
+            if !captcha_code.is_empty() {
+                let url = format!(
+                    "https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone={}&captchaCode={}",
+                    encode(user_phone),
+                    encode(&captcha_code)
+                );
+
+                let result: ResultBase<bool> = match self.get_json(&url).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        write_line(&format!("重试{}, GetSmsCode Error:{}", i, e));
+                        continue;
+                    }
+                };
+
+                if result.code == 0 {
+                    return true;
+                }
+
+                let msg = if result.msg.is_empty() { "Unknown error".to_string() } else { result.msg };
+                write_line(&format!("重试{}, GetSmsCode Error:{}", i, msg));
+            }
+        }
+        false
+    }
+
+    async fn binding_device(&self, verification_code: &str) -> bool {
+        let url = format!(
+            "https://desk.ctyun.cn:8810/api/cdserv/client/device/binding?verificationCode={}&deviceName=Chrome%E6%B5%8F%E8%A7%88%E5%99%A8&deviceCode={}&deviceModel=Windows+NT+10.0%3B+Win64%3B+x64&sysVersion=Windows+NT+10.0%3B+Win64%3B+x64&appVersion=3.2.0&hostName=pc.ctyun.cn&deviceInfo=Win32",
+            encode(verification_code),
+            encode(&self.device_code)
+        );
+
+        let result: ResultBase<bool> = match self.post_json(&url, Option::<serde_json::Value>::None).await {
+            Ok(r) => r,
+            Err(e) => {
+                write_line(&format!("BindingDevice Error:{}", e));
+                return false;
+            }
+        };
+
+        if result.code == 0 {
+            true
+        } else {
+            let msg = if result.msg.is_empty() { "Unknown error".to_string() } else { result.msg };
+            write_line(&format!("BindingDevice Error:{}", msg));
+            false
+        }
     }
 
     async fn get_gen_challenge_data(&self) -> Option<ChallengeData> {
@@ -474,7 +453,12 @@ impl CtYunApi {
         };
 
         if result.code == 0 {
-            Some(result.data)
+            if let Some(data) = result.data {
+                Some(data)
+            } else {
+                write_line("GetGenChallengeDataAsync Error: missing data");
+                None
+            }
         } else {
             let msg = if result.msg.is_empty() { "Unknown error".to_string() } else { result.msg };
             write_line(&format!("GetGenChallengeDataAsync Error:{}", msg));
@@ -497,6 +481,17 @@ impl CtYunApi {
         }
     }
 
+    async fn get_sms_code_captcha(&self) -> Vec<u8> {
+        let url = "https://desk.ctyun.cn:8810/api/auth/client/validateCode/captcha?width=120&height=40&_t=1766158569152";
+        match self.get_bytes(url, true).await {
+            Ok(data) => data,
+            Err(e) => {
+                write_line(&format!("短信验证码获取错误：{}", e));
+                Vec::new()
+            }
+        }
+    }
+
     async fn get_captcha(&self, img_bytes: Vec<u8>) -> Option<String> {
         if img_bytes.is_empty() {
             return None;
@@ -505,13 +500,9 @@ impl CtYunApi {
         write_line("正在识别验证码.");
 
         let encoded = STANDARD.encode(&img_bytes);
-        let form = multipart::Form::new()
-            .text("image", encoded);
+        let form = multipart::Form::new().text("image", encoded);
 
-        let mut headers = HashMap::new();
-        headers.insert("Content-Type".to_string(), "multipart/form-data".to_string());
-
-        let resp = match self.request("POST", "https://orc.1999111.xyz/ocr", Some(form), Some(headers), false).await {
+        let resp = match self.request("POST", "https://orc.1999111.xyz/ocr", Some(form), None, false).await {
             Ok(r) => r,
             Err(e) => {
                 write_line(&format!("验证码识别错误：{}", e));
@@ -551,7 +542,12 @@ impl CtYunApi {
         };
 
         if result.code == 0 {
-            Some(result.data.desktop_list)
+            if let Some(data) = result.data {
+                Some(data.desktop_list)
+            } else {
+                write_line("获取设备信息错误。missing data");
+                None
+            }
         } else {
             let msg = if result.msg.is_empty() { "Unknown error".to_string() } else { result.msg };
             write_line(&format!("获取设备信息错误。{}", msg));
@@ -576,7 +572,11 @@ impl CtYunApi {
         ).await?;
 
         if result.code == 0 {
-            Ok((result.data, String::new()))
+            if let Some(data) = result.data {
+                Ok((data, String::new()))
+            } else {
+                Err(anyhow!("missing data"))
+            }
         } else {
             let msg = if result.msg.is_empty() { "Unknown error".to_string() } else { result.msg };
             Err(anyhow!("{}", msg))
@@ -719,6 +719,11 @@ impl CtYunApi {
         Ok(serde_json::from_slice(&resp)?)
     }
 
+    async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T> {
+        let resp = self.request_bytes("GET", url, None, None, true).await?;
+        Ok(serde_json::from_slice(&resp)?)
+    }
+
     async fn post_form<T: for<'de> Deserialize<'de>>(
         &self,
         url: &str,
@@ -773,21 +778,114 @@ fn generate_random_string(length: usize) -> String {
         .collect()
 }
 
+fn read_line(prompt: &str) -> Result<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim_end_matches(&['\r', '\n'][..]).to_string())
+}
+
+fn resolve_accounts() -> Result<Vec<Account>> {
+    if Path::new("/.dockerenv").exists() {
+        let user = env::var("APP_USER").unwrap_or_default();
+        let password = env::var("APP_PASSWORD").unwrap_or_default();
+        let device_code = env::var("DEVICECODE").unwrap_or_default();
+        if user.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Ok(vec![Account {
+            user_account: user,
+            password,
+            device_code,
+        }]);
+    }
+
+    let config_file = "config.json";
+    if let Ok(data) = fs::read_to_string(config_file)
+        && let Ok(accounts) = serde_json::from_str::<AccountsFile>(&data)
+        && !accounts.accounts.is_empty()
+    {
+        let mut decoded = Vec::new();
+        for account in accounts.accounts {
+            let user = decode_base64(&account.user_account).unwrap_or_default();
+            let password = decode_base64(&account.password).unwrap_or_default();
+            if !user.is_empty() {
+                decoded.push(Account {
+                    user_account: user,
+                    password,
+                    device_code: account.device_code,
+                });
+            }
+        }
+        return Ok(decoded);
+    }
+
+    let mut accounts = AccountsFile { accounts: Vec::new() };
+
+    loop {
+        let device_code = format!("web_{}", generate_random_string(32));
+        let user = read_line("账号: ")?;
+        let password = read_line("密码: ")?;
+
+        let encoded_user = encode_base64(&user);
+        let encoded_password = encode_base64(&password);
+
+        accounts.accounts.push(Account {
+            user_account: encoded_user,
+            password: encoded_password,
+            device_code: device_code.clone(),
+        });
+
+        let continue_input = read_line("是否继续添加账户? (y/n): ")?;
+        if continue_input.trim().to_lowercase() != "y" {
+            break;
+        }
+    }
+
+    let data = serde_json::to_string_pretty(&accounts)?;
+    let _ = fs::write(config_file, data);
+
+    let mut decoded = Vec::new();
+    for account in accounts.accounts {
+        let user = decode_base64(&account.user_account).unwrap_or_default();
+        let password = decode_base64(&account.password).unwrap_or_default();
+        if !user.is_empty() {
+            decoded.push(Account {
+                user_account: user,
+                password,
+                device_code: account.device_code,
+            });
+        }
+    }
+    Ok(decoded)
+}
+
 async fn receive_loop(
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ws_stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     desktop: Desktop,
-    api: Arc<Mutex<CtYunApi>>,
+    api: Arc<CtYunApi>,
+    session_timeout: Duration,
 ) -> Result<()> {
     let mut encryptor = Encryption::new();
     let mut ws = ws_stream;
+    let session_timer = tokio::time::sleep(session_timeout);
+    tokio::pin!(session_timer);
 
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
                 write_line(&format!("[{}] 正在退出...", desktop.desktop_code));
+                return Err(anyhow!("context canceled"));
+            }
+            _ = &mut session_timer => {
+                let _ = ws.send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Normal,
+                    reason: Cow::from("Timeout Reset"),
+                }))).await;
                 return Ok(());
             }
             result = ws.next() => {
@@ -804,27 +902,24 @@ async fn receive_loop(
 
                             let infos = SendInfo::from_buffer(&message);
                             for info in infos {
-                                if info.type_val == 103 {
-                                    let api_guard = api.lock().await;
-                                    if let Some(ref login_info) = api_guard.login_info {
-                                        let user_json = serde_json::json!({
-                                            "type":1,
-                                            "userName": login_info.user_name,
-                                            "userInfo": "",
-                                            "userId": login_info.user_id,
-                                        });
-                                        let payload = SendInfo {
-                                            type_val: 118,
-                                            data: serde_json::to_vec(&user_json).unwrap(),
-                                        }.to_buffer(true);
-                                        let _ = ws.send(Message::Binary(payload)).await;
-                                    }
+                                if info.type_val == 103 && let Some(ref login_info) = api.login_info {
+                                    let user_json = serde_json::json!({
+                                        "type":1,
+                                        "userName": login_info.user_name,
+                                        "userInfo": "",
+                                        "userId": login_info.user_id,
+                                    });
+                                    let payload = SendInfo {
+                                        type_val: 118,
+                                        data: serde_json::to_vec(&user_json).unwrap(),
+                                    }.to_buffer(true);
+                                    let _ = ws.send(Message::Binary(payload)).await;
                                 }
                             }
                         }
                     }
                     Some(Err(e)) => return Err(anyhow!("WebSocket error: {}", e)),
-                    None => return Ok(()),
+                    None => return Err(anyhow!("WebSocket closed")),
                 }
             }
         }
@@ -833,7 +928,7 @@ async fn receive_loop(
 
 async fn keep_alive_worker(
     desktop: Desktop,
-    api: Arc<Mutex<CtYunApi>>,
+    api: Arc<CtYunApi>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let initial_payload = STANDARD.decode("UkVEUQIAAAACAAAAGgAAAAAAAAABAAEAAAABAAAAEgAAAAkAAAAECAAA").unwrap();
@@ -854,7 +949,22 @@ async fn keep_alive_worker(
 
         write_line(&format!("[{}] === 新周期开始，尝试连接 ===", desktop.desktop_code));
 
-        match connect_async(&uri).await {
+        let mut request = match uri.clone().into_client_request() {
+            Ok(req) => req,
+            Err(e) => {
+                write_line(&format!("[{}] 异常: {}", desktop.desktop_code, e));
+                continue;
+            }
+        };
+
+        if let Ok(value) = "https://pc.ctyun.cn".parse() {
+            request.headers_mut().insert("Origin", value);
+        }
+        if let Ok(value) = "binary".parse() {
+            request.headers_mut().insert("Sec-WebSocket-Protocol", value);
+        }
+
+        match connect_async(request).await {
             Ok((ws_stream, _)) => {
                 let connect_message = serde_json::json!({
                     "type": 1,
@@ -879,15 +989,27 @@ async fn keep_alive_worker(
                     let api_clone = Arc::clone(&api);
                     let desktop_clone = desktop.clone();
                     let shutdown_rx_clone = shutdown_rx.resubscribe();
-                    let result = receive_loop(shutdown_rx_clone, ws, desktop_clone, api_clone).await;
+                    let result = receive_loop(
+                        shutdown_rx_clone,
+                        ws,
+                        desktop_clone,
+                        api_clone,
+                        Duration::from_secs(60 * 60),
+                    ).await;
 
                     if let Err(e) = result {
                         let err_str = e.to_string();
                         if err_str.contains("1005") || err_str.contains("CloseNoStatusReceived") {
-                            write_line(&format!("[{}] 连接被对端关闭(1005)，不影响脚本使用，准备重连", desktop.desktop_code));
-                        } else {
+                            write_line(&format!("[{}] 警告: 连接被对端关闭(1005)，不影响脚本使用，准备重连", desktop.desktop_code));
+                        } else if err_str.contains("connection reset by peer") {
+                            write_line(&format!("[{}] 警告: 连接被对端重置，不影响脚本使用，准备重连", desktop.desktop_code));
+                        } else if !err_str.contains("context canceled") && !err_str.contains("deadline exceeded") {
                             write_line(&format!("[{}] 异常: {}", desktop.desktop_code, e));
+                        } else {
+                            continue;
                         }
+                    } else {
+                        write_line(&format!("[{}] 60秒时间到，准备重连...", desktop.desktop_code));
                     }
                 } else {
                     write_line(&format!("[{}] 发送连接消息失败", desktop.desktop_code));
@@ -910,18 +1032,17 @@ async fn keep_alive_worker(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::load_or_create()?;
-
-    if config.accounts.is_empty() {
-        write_line("没有配置的账号");
+    write_line("版本：v 1.0.0");
+    let accounts = resolve_accounts()?;
+    if accounts.is_empty() {
         return Ok(());
     }
 
-    let mut all_desktops = Vec::new();
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let mut handles = Vec::new();
 
-    for account in &config.accounts {
+    for account in accounts {
         write_line(&format!("正在登录账号: {}", account.user_account));
-        
         let mut api = CtYunApi::new(account.device_code.clone());
 
         if !api.login(&account.user_account, &account.password).await {
@@ -929,9 +1050,17 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        write_line(&format!("账号 {} 登录成功", account.user_account));
+        if let Some(ref login_info) = api.login_info
+            && !login_info.bonded_device
+        {
+            let _ = api.get_sms_code(&account.user_account).await;
+            let verification_code = read_line("短信验证码: ")?;
+            if !api.binding_device(&verification_code).await {
+                continue;
+            }
+        }
 
-        let desktop_list = match api.get_client_list().await {
+        let desktops = match api.get_client_list().await {
             Some(list) => list,
             None => {
                 write_line(&format!("账号 {} 获取设备列表失败", account.user_account));
@@ -939,45 +1068,41 @@ async fn main() -> Result<()> {
             }
         };
 
-        if desktop_list.is_empty() {
-            write_line(&format!("账号 {} 没有可用的设备", account.user_account));
+        let mut active = Vec::new();
+        for mut desktop in desktops {
+            if desktop.use_status_text != "运行中" {
+                write_line(&format!(
+                    "[{}] [{}]电脑未开机，正在开机，请在2分钟后重新运行软件",
+                    desktop.desktop_code,
+                    desktop.use_status_text
+                ));
+            }
+
+            match api.connect(&desktop.desktop_id).await {
+                Ok((info, _)) => {
+                    desktop.desktop_info = Some(info.desktop_info);
+                    active.push(desktop);
+                }
+                Err(e) => {
+                    write_line(&format!("Connect Error: [{}] {}", desktop.desktop_id, e));
+                }
+            }
+        }
+
+        if active.is_empty() {
             continue;
         }
 
-        for desktop in desktop_list {
-            all_desktops.push((desktop, account.device_code.clone()));
+        write_line("保活任务启动：每 60 秒强制重连一次。");
+        let api = Arc::new(api);
+        for desktop in active {
+            let api_clone = Arc::clone(&api);
+            let shutdown_rx = shutdown_tx.subscribe();
+            let handle = tokio::spawn(async move {
+                keep_alive_worker(desktop, api_clone, shutdown_rx).await;
+            });
+            handles.push(handle);
         }
-    }
-
-    if all_desktops.is_empty() {
-        write_line("没有可用的设备");
-        return Ok(());
-    }
-
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-    let mut handles = Vec::new();
-
-    for (desktop, device_code) in all_desktops {
-        let api = CtYunApi::new(device_code);
-        
-        let connect_info = match api.connect(&desktop.desktop_id).await {
-            Ok((info, _)) => info,
-            Err(e) => {
-                write_line(&format!("[{}] 连接失败: {}", desktop.desktop_code, e));
-                continue;
-            }
-        };
-
-        let mut desktop_with_info = desktop.clone();
-        desktop_with_info.desktop_info = Some(connect_info.desktop_info);
-        let api = Arc::new(Mutex::new(api));
-        let shutdown_rx = shutdown_tx.subscribe();
-
-        let handle = tokio::spawn(async move {
-            keep_alive_worker(desktop_with_info, api, shutdown_rx).await;
-        });
-
-        handles.push(handle);
     }
 
     tokio::signal::ctrl_c().await?;
